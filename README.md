@@ -3,7 +3,15 @@
 A universal IR remote cloner for the M5StickS3, with a Nemo-style orange-on-black UI.
 
 - **Watch face** on startup: time, date, battery. Screen turns off after **10 s** of inactivity (any button wakes it). While the screen is off the chip drops into **light sleep** (~2 mA on battery), so it survives a night on the nightstand; the alarm/timer still fire. On USB power it stays fully awake instead.
+- **Raise-to-wake**: tilt/rotate your wrist toward you and the watch face lights up (like a smartwatch). Toggle in *Settings → Raise-wake* — it polls the IMU ~4×/s during sleep, so it costs some battery.
+- **Level**: 3-axis bubble level for desks, shelves, picture frames — works in any orientation, beeps and turns green when level.
+- **Settings**: set clock/date, pick a **color theme** (applied live), toggle raise-to-wake.
+- **Games**: currently **locked** (`GAMES_UNLOCKED` in [config.h](include/config.h)) — the Dino game stays in the build and is one flag away.
 - **Green LED**: off by default — lights only while a button is held or IR capture/send is running.
+
+### Battery readout
+
+The percentage keeps a hidden **30 % buffer**: it shows `0%` while ~30 % of real charge remains (the device keeps working below the shown 0 %). The number turns **red and blinks** at/below a shown **15 %**. Both thresholds are in [config.h](include/config.h) (`BATT_BUFFER_PCT`, `BATT_WARN_PCT`).
 - **Copy IR signal**: point any remote (TV, AC, stereo…) at the top of the stick, press a button on the remote — the raw signal is captured via the ESP32-S3 RMT peripheral.
 - **Name & save**: give the capture a name with the on-device editor (a default like `IR_01` is pre-filled), stored on LittleFS flash — survives reboots and battery drain.
 - **Replay**: pick a saved signal and send it through the built-in IR LED.
@@ -62,8 +70,12 @@ If the upload fails, put the StickS3 into download mode (see M5Stack docs) and r
 | [src/main.cpp](src/main.cpp) | App state machine: watch, sleep, menus, alarm/timer/stopwatch, editors |
 | [src/ir_engine.cpp](src/ir_engine.cpp) | RMT-based raw IR burst capture + 38 kHz replay, NEC decode |
 | [src/ir_store.cpp](src/ir_store.cpp) | LittleFS persistence (`/ir/<name>.ir`) |
-| [src/dino_game.cpp](src/dino_game.cpp) | Chrome-dino-style jumping game |
+| [src/dino_game.cpp](src/dino_game.cpp) | Chrome-dino-style jumping game (under the locked Games menu) |
+| [src/level_tool.cpp](src/level_tool.cpp) | 3-axis IMU bubble level |
+| [src/theme.cpp](src/theme.cpp) | Runtime color themes (the `COL_*` globals) |
 | [src/ui.cpp](src/ui.cpp) | Nemo-style canvas UI: header bar, list menus, toasts |
-| [include/config.h](include/config.h) | Pins, timeouts, theme colors |
+| [include/config.h](include/config.h) | Pins, timeouts, feature switches, battery/wrist tuning |
+
+The alarm is **one-shot**: it disarms itself after ringing, so you re-enable it for the next day.
 
 The speaker is normally disabled (it interferes with the StickS3 IR receiver) and is only switched on while an alarm/timer alert is ringing.

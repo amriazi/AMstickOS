@@ -18,6 +18,8 @@
 #include "dino_game.h"
 #include "ir_engine.h"
 #include "ir_store.h"
+#include "level_tool.h"
+#include "theme.h"
 #include "ui.h"
 
 // ---------------------------------------------------------------- state
@@ -37,7 +39,11 @@ enum State {
   ST_TIMER_SET,
   ST_TIMER_RUN,
   ST_STOPWATCH,
+  ST_LEVEL,
+  ST_GAMES,
   ST_DINO,
+  ST_SETTINGS,
+  ST_THEME,
   ST_ALERT,
 };
 
@@ -71,12 +77,11 @@ static rmt_symbol_word_t s_sendBuf[IrEngine::kMaxSymbols];
 static int s_clk[5];
 static int s_clkField = 0;
 
-// alarm (persisted to NVS): fires once per matching minute
+// alarm (persisted to NVS): one-shot, disarms itself after firing
 static bool s_alarmOn = false;
 static int s_alarmH = 7, s_alarmM = 0;
 static int s_almEdit[3];  // on/off, hour, minute
 static int s_almField = 0;
-static int s_lastAlarmFire = -1;
 
 // countdown timer (keeps running while you use other screens)
 static bool s_timerActive = false;
@@ -98,14 +103,25 @@ static const char* s_alertText = "";
 static uint32_t s_alertStart = 0;
 static bool s_alertPhase = false;
 
-static const String kMainItems[] = {"Copy IR signal", "Saved signals",
-                                    "Alarm",          "Timer",
-                                    "Stopwatch",      "Dino game",
-                                    "Set clock",      "Back to watch"};
-static const int kMainCount = 8;
+// settings
+static bool s_wristWake = true;  // raise-to-wake gesture (battery cost)
+
+// submenu selections
+static int s_gameSel = 0;
+static int s_setSel = 0;
+static int s_themeSel = 0;
+static int s_themeOrig = 0;
+
+static const String kMainItems[] = {
+    "Copy IR signal", "Saved signals", "Alarm",        "Timer",
+    "Stopwatch",      "Level",         "Games",        "Settings",
+    "Back to watch"};
+static const int kMainCount = 9;
 static const String kRecItems[] = {"Save", "Retry", "Discard"};
 static const String kActItems[] = {"Send", "Delete", "Back"};
 static const String kYesNo[] = {"No", "Yes"};
+static const String kGameItems[] = {"Dino", "Back"};
+static const int kGameCount = 2;
 
 static void enter(State st) {
   s_state = st;
@@ -127,6 +143,17 @@ static void ledSet(bool on) {
   } else {
     M5.In_I2C.bitOff(kPm1Addr, 0x06, 1 << 4, 100000);
   }
+}
+
+// ------------------------------------------------------------- battery
+// Reserve a hidden buffer so the device keeps running below the shown
+// 0%. Returns the user-facing percentage 0..100.
+static int displayBattery() {
+  int raw = M5.Power.getBatteryLevel();
+  int scaled = (raw - BATT_BUFFER_PCT) * 100 / (100 - BATT_BUFFER_PCT);
+  if (scaled < 0) scaled = 0;
+  if (scaled > 100) scaled = 100;
+  return scaled;
 }
 
 // ---------------------------------------------------------------- clock
@@ -173,11 +200,37 @@ static int daysInMonth(int year, int month) {
 
 // ---------------------------------------------------------------- sleep
 
+// Raise-to-wake: true once when the screen transitions from "not facing
+// the user" to "facing up", i.e. a wrist raise. Hysteresis (WRIST_UP_G
+// vs WRIST_DOWN_G) stops it re-triggering while held up.
+static bool s_wristArmedUp = true;  // set on sleep entry from current pose
+
+static bool detectRaise() {
+  M5.Imu.update();
+  float ax = 0, ay = 0, az = 0;
+  if (!M5.Imu.getAccel(&ax, &ay, &az)) return false;
+  const float aa[3] = {ax, ay, az};
+  const float axis = aa[WRIST_AXIS] * WRIST_SIGN;
+
+  if (axis < WRIST_DOWN_G) {
+    s_wristArmedUp = false;  // lowered -> arm
+    return false;
+  }
+  if (axis > WRIST_UP_G && !s_wristArmedUp) {
+    s_wristArmedUp = true;
+    return true;  // just raised
+  }
+  return false;
+}
+
 static void goSleep() {
   persistClock();
   M5.Display.setBrightness(0);
   M5.Display.sleep();
   setCpuFrequencyMhz(80);
+  // Treat the current pose as "already up" so setting it down screen-up
+  // doesn't immediately wake; a real raise must come from a lower pose.
+  s_wristArmedUp = true;
   s_state = ST_SLEEP;
 }
 
@@ -235,10 +288,10 @@ static void serviceAlarm() {
   time_t now = time(nullptr);
   struct tm lt;
   localtime_r(&now, &lt);
-  const int key = lt.tm_yday * 10000 + lt.tm_hour * 100 + lt.tm_min;
-  if (lt.tm_hour == s_alarmH && lt.tm_min == s_alarmM &&
-      key != s_lastAlarmFire) {
-    s_lastAlarmFire = key;
+  if (lt.tm_hour == s_alarmH && lt.tm_min == s_alarmM) {
+    // One-shot: disarm after firing so it must be re-enabled each time.
+    s_alarmOn = false;
+    s_prefs.putBool("alOn", false);
     fireAlert("ALARM!");
   }
 }
@@ -251,11 +304,18 @@ static uint32_t swElapsed() {
 
 static void drawWatch(bool force) {
   static int lastSec = -1;
+  static int lastBlink = -1;
   time_t now = time(nullptr);
   struct tm lt;
   localtime_r(&now, &lt);
-  if (!force && lt.tm_sec == lastSec) return;
+
+  const int batt = displayBattery();
+  const bool charging = M5.Power.isCharging() == m5::Power_Class::is_charging;
+  const bool warn = batt <= BATT_WARN_PCT && !charging;
+  const int blink = warn ? (int)((millis() / 500) & 1) : 0;
+  if (!force && lt.tm_sec == lastSec && blink == lastBlink) return;
   lastSec = lt.tm_sec;
+  lastBlink = blink;
 
   char hhmm[8], secs[4], date[32];
   strftime(hhmm, sizeof(hhmm), "%H:%M", &lt);
@@ -265,14 +325,17 @@ static void drawWatch(bool force) {
   M5Canvas& cv = UI::cv();
   UI::clear();
 
-  // battery, top-right (+ flash icon when charging)
+  // battery, top-right (+ flash icon when charging). Below the warning
+  // threshold the readout is red and blinks.
   char bat[8];
-  snprintf(bat, sizeof(bat), "%d%%", M5.Power.getBatteryLevel());
+  snprintf(bat, sizeof(bat), "%d%%", batt);
   cv.setFont(&fonts::Font0);
-  cv.setTextColor(COL_DIM, COL_BG);
   cv.setTextDatum(top_right);
-  cv.drawString(bat, cv.width() - 4, 4);
-  if (M5.Power.isCharging() == m5::Power_Class::is_charging) {
+  if (!(warn && blink)) {  // blink = hide on alternate phase
+    cv.setTextColor(warn ? TFT_RED : COL_DIM, COL_BG);
+    cv.drawString(bat, cv.width() - 4, 4);
+  }
+  if (charging) {
     const int bx = cv.width() - 4 - cv.textWidth(bat) - 11;
     const int by = 2;
     cv.fillTriangle(bx + 6, by, bx + 1, by + 6, bx + 4, by + 6, TFT_YELLOW);
@@ -579,6 +642,44 @@ static void drawAlert() {
   UI::push();
 }
 
+static void drawSettings() {
+  String items[3];
+  items[0] = "Set clock/date";
+  items[1] = "Theme: " + String(Theme::name(Theme::current()));
+  items[2] = String("Raise-wake: ") + (s_wristWake ? "ON" : "OFF");
+  // (Back is implied by hold-Blue; keeps the list short.)
+  UI::drawMenu("SETTINGS", items, 3, s_setSel,
+               "Low: next   Blue: select   hold Blue: back");
+}
+
+static void drawTheme() {
+  // Live preview: the palette is applied as you scroll, so the whole
+  // screen recolors. Shows the name plus a sample of UI elements.
+  M5Canvas& cv = UI::cv();
+  UI::clear();
+  UI::drawHeader("THEME");
+
+  char title[24];
+  snprintf(title, sizeof(title), "%d/%d  %s", s_themeSel + 1, Theme::count(),
+           Theme::name(s_themeSel));
+  cv.setFont(&fonts::Font4);
+  cv.setTextColor(COL_FG, COL_BG);
+  cv.setTextDatum(middle_center);
+  cv.drawString(title, cv.width() / 2, 46);
+
+  // sample: selected bar + dim text, exactly like the menus
+  cv.fillRoundRect(20, 66, cv.width() - 40, 20, 3, COL_SEL_BG);
+  cv.setTextColor(COL_SEL_FG, COL_SEL_BG);
+  cv.setFont(&fonts::Font2);
+  cv.setTextDatum(middle_center);
+  cv.drawString("selected item", cv.width() / 2, 76);
+  cv.setTextColor(COL_DIM, COL_BG);
+  cv.drawString("dimmed hint text", cv.width() / 2, 96);
+
+  UI::drawFooter("Low: next   Blue: save   hold Blue: cancel");
+  UI::push();
+}
+
 // ---------------------------------------------------------------- helpers
 
 static void suggestName() {
@@ -715,7 +816,7 @@ static void applyClock() {
 
 void setup() {
   auto cfg = M5.config();
-  cfg.internal_imu = false;  // unused - saves power
+  cfg.internal_imu = true;   // raise-to-wake + level tool
   cfg.internal_mic = false;  // unused - saves power
   M5.begin(cfg);
   M5.Display.setRotation(3);
@@ -734,6 +835,8 @@ void setup() {
   s_alarmOn = s_prefs.getBool("alOn", false);
   s_alarmH = s_prefs.getInt("alH", 7);
   s_alarmM = s_prefs.getInt("alM", 0);
+  s_wristWake = s_prefs.getBool("wrist", true);
+  Theme::load();
   UI::begin();
 
   bool irOk = IrEngine::begin();
@@ -786,11 +889,18 @@ void loop() {
       uint32_t chunkMs = 30000;
       if (s_timerActive && !s_timerPaused) chunkMs = 500;
       else if (s_alarmOn) chunkMs = 2000;
+      // Raise-to-wake needs frequent accelerometer polling, which costs
+      // battery - hence it is a toggle in Settings.
+      if (s_wristWake && chunkMs > WRIST_POLL_MS) chunkMs = WRIST_POLL_MS;
       gpio_wakeup_enable(GPIO_NUM_11, GPIO_INTR_LOW_LEVEL);
       gpio_wakeup_enable(GPIO_NUM_12, GPIO_INTR_LOW_LEVEL);
       esp_sleep_enable_gpio_wakeup();
       esp_sleep_enable_timer_wakeup((uint64_t)chunkMs * 1000);
       esp_light_sleep_start();
+      if (s_wristWake && !M5.BtnA.isPressed() && !M5.BtnB.isPressed() &&
+          detectRaise()) {
+        wakeUp();
+      }
     }
     return;
   }
@@ -842,9 +952,18 @@ void loop() {
             }
             break;
           case 4: enter(ST_STOPWATCH); break;
-          case 5: DinoGame::reset(); enter(ST_DINO); break;
-          case 6: initClockEditor(); enter(ST_CLOCK_SET); break;
-          case 7: enter(ST_WATCH); break;
+          case 5: LevelTool::begin(); enter(ST_LEVEL); break;
+          case 6:  // Games (locked for now)
+            if (GAMES_UNLOCKED) {
+              s_gameSel = 0;
+              enter(ST_GAMES);
+            } else {
+              UI::toast("GAMES", "Locked", 800);
+              s_dirty = true;
+            }
+            break;
+          case 7: s_setSel = 0; enter(ST_SETTINGS); break;
+          case 8: enter(ST_WATCH); break;
         }
         break;
       }
@@ -1017,12 +1136,12 @@ void loop() {
         if (++s_clkField > 4) {
           applyClock();
           UI::toast("CLOCK", "Time set", 700);
-          enter(ST_MENU);
+          enter(ST_SETTINGS);
           break;
         }
         s_dirty = true;
       }
-      if (aH || idle > MENU_TIMEOUT_MS) { enter(ST_MENU); break; }
+      if (aH || idle > MENU_TIMEOUT_MS) { enter(ST_SETTINGS); break; }
       if (s_dirty) { drawClockSet(); s_dirty = false; }
       break;
 
@@ -1110,9 +1229,73 @@ void loop() {
       }
       break;
 
+    case ST_LEVEL:
+      s_lastActivity = millis();  // no screen timeout while leveling
+      if (LevelTool::frame() == LevelTool::kExit) {
+        LevelTool::end();
+        enter(ST_MENU);
+      }
+      break;
+
+    case ST_GAMES:
+      if (bC) { s_gameSel = (s_gameSel + 1) % kGameCount; s_dirty = true; }
+      if (aC) {
+        if (s_gameSel == 0) { DinoGame::reset(); enter(ST_DINO); }
+        else { enter(ST_MENU); }
+        break;
+      }
+      if (aH || idle > MENU_TIMEOUT_MS) { enter(ST_MENU); break; }
+      if (s_dirty) {
+        UI::drawMenu("GAMES", kGameItems, kGameCount, s_gameSel,
+                     "Low: next   Blue: select   hold Blue: back");
+        s_dirty = false;
+      }
+      break;
+
     case ST_DINO:
       s_lastActivity = millis();  // no screen timeout mid-game
-      if (DinoGame::frame() == DinoGame::kExit) enter(ST_MENU);
+      if (DinoGame::frame() == DinoGame::kExit) enter(ST_GAMES);
+      break;
+
+    case ST_SETTINGS:
+      if (bC) { s_setSel = (s_setSel + 1) % 3; s_dirty = true; }
+      if (aC) {
+        if (s_setSel == 0) {
+          initClockEditor();
+          enter(ST_CLOCK_SET);
+        } else if (s_setSel == 1) {
+          s_themeOrig = Theme::current();
+          s_themeSel = s_themeOrig;
+          enter(ST_THEME);
+        } else {
+          s_wristWake = !s_wristWake;
+          s_prefs.putBool("wrist", s_wristWake);
+          s_dirty = true;
+        }
+        break;
+      }
+      if (aH || idle > MENU_TIMEOUT_MS) { enter(ST_MENU); break; }
+      if (s_dirty) { drawSettings(); s_dirty = false; }
+      break;
+
+    case ST_THEME:
+      if (bC) {
+        s_themeSel = (s_themeSel + 1) % Theme::count();
+        Theme::apply(s_themeSel);  // live preview
+        s_dirty = true;
+      }
+      if (aC) {
+        Theme::save(s_themeSel);
+        UI::toast("THEME", Theme::name(s_themeSel), 700);
+        enter(ST_SETTINGS);
+        break;
+      }
+      if (aH || idle > MENU_TIMEOUT_MS) {
+        Theme::apply(s_themeOrig);  // cancel -> revert
+        enter(ST_SETTINGS);
+        break;
+      }
+      if (s_dirty) { drawTheme(); s_dirty = false; }
       break;
 
     case ST_ALERT: {
